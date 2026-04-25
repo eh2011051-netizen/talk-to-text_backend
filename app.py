@@ -5350,11 +5350,22 @@ friends_bp = Blueprint('friends', __name__)
 def get_friends():
     user_id = int(get_jwt_identity())
     
+    # Self-healing: Ensure self-friendship exists
+    self_f = Friendship.query.filter_by(user_id=user_id, friend_id=user_id).first()
+    if not self_f:
+        try:
+            self_f = Friendship(user_id=user_id, friend_id=user_id)
+            db.session.add(self_f)
+            db.session.commit()
+            logger.info(f"Auto-fixed missing self-friendship for user {user_id}")
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Failed to auto-fix self-friendship: {e}")
+
     # Fetch all non-deleted friendships involving this user
-    # Also include blocked friendships so the user can see/manage blocked contacts
     friendships = Friendship.query.filter(
         ((Friendship.user_id == user_id) | (Friendship.friend_id == user_id)),
-        Friendship.is_deleted == False  # CRITICAL: exclude soft-deleted friendships
+        Friendship.is_deleted == False
     ).all()
     
     friends = []
@@ -6235,13 +6246,12 @@ def search_users():
             return jsonify([])
         
         users = User.query.filter(
-            (User.email.ilike(f"%{q}%")) | (User.full_name.ilike(f"%{q}%"))
+            (User.email.ilike(f"%{q.strip()}%")) | (User.full_name.ilike(f"%{q.strip()}%"))
         ).limit(10).all()
         
         result = []
         for u in users:
-            if u.id == user_id:
-                continue
+            is_self = (u.id == user_id)
                 
             # Check if already friends or requested
             friendship = Friendship.query.filter(
@@ -6260,6 +6270,7 @@ def search_users():
                 "image": u.image,
                 "isFriend": friendship is not None,
                 "requestPending": request_pending,
+                "isSelf": is_self,
                 "bio": u.bio
             })
         return jsonify(result)
