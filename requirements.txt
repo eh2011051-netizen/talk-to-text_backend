@@ -31,3 +31,4 @@ websockets==12.0
 numpy==1.26.4
 Pillow==10.4.0
 pytesseract==0.3.13
+beautifulsoup4==4.12.3
