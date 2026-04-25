@@ -98,8 +98,8 @@ app.config['OUTPUT_FOLDER'] = "outputs"
 import os
 from pathlib import Path
 
-# Fix for deployment data loss: Ensure SQLite uses a persistent data directory if PostgreSQL is not provided.
-DATA_DIR = os.getenv('DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+# Fix for deployment data loss: Ensure SQLite uses a persistent instance directory if PostgreSQL is not provided.
+DATA_DIR = os.getenv('DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance'))
 os.makedirs(DATA_DIR, exist_ok=True)
 default_sqlite = f"sqlite:///{os.path.join(DATA_DIR, 'database.db')}"
 
@@ -5378,7 +5378,7 @@ def get_friends():
 
         friends.append({
             "id": other_user.id,
-            "name": other_user.full_name,
+            "name": f"{other_user.full_name} (You)" if other_user.id == user_id else other_user.full_name,
             "email": other_user.email,
             "image": other_user.image,
             "isFriend": True,
