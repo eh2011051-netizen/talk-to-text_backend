@@ -110,6 +110,12 @@ if db_uri.startswith("postgres://"):
 
 app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Debug: Log the database being used (safely)
+db_type = "PostgreSQL" if "postgresql" in db_uri else "SQLite"
+print(f"DATABASE TYPE: {db_type}")
+if db_type == "SQLite":
+    print(f"SQLITE PATH: {db_uri}")
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-jwt-key-change-in-prod')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
@@ -122,6 +128,16 @@ app.config['JWT_HEADER_TYPE'] = 'Bearer'
 UPLOAD_DIR = app.config['UPLOAD_FOLDER']
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# SECRET WIPE ROUTE (DELETE AFTER USE)
+@app.route('/api/debug/wipe-database-998877', methods=['GET'])
+def secret_wipe():
+    try:
+        db.drop_all()
+        db.create_all()
+        return "Database wiped successfully! You can now register new accounts.", 200
+    except Exception as e:
+        return f"Error wiping database: {str(e)}", 500
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
@@ -1948,10 +1964,13 @@ def register():
     if not phone_number.startswith("+"):
         return jsonify({"error": "Phone number must start with '+' (e.g., +92...)"}), 400
 
+    print(f"Checking registration for: {data['email']} / {phone_number}")
     if User.query.filter_by(email=data["email"]).first():
+        print("Registration Error: Email already exists in database")
         return jsonify({"error": "Email already registered"}), 400
     
     if User.query.filter_by(phone_number=phone_number).first():
+        print("Registration Error: Phone number already exists in database")
         return jsonify({"error": "Phone number already registered"}), 400
 
     hashed = generate_password_hash(data["password"])
