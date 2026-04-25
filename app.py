@@ -93,6 +93,10 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     return response
+
+@app.route("/", methods=["GET"])
+def home():
+    return f"TalkToText Pro Backend is running on: talk-to-textbackend-production.up.railway.app", 200
 app.config['UPLOAD_FOLDER'] = "uploads"
 app.config['OUTPUT_FOLDER'] = "outputs"
 import os
