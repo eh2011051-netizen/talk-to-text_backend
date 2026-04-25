@@ -129,18 +129,25 @@ UPLOAD_DIR = app.config['UPLOAD_FOLDER']
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+
 # SECRET WIPE ROUTE (DELETE AFTER USE)
 @app.route('/api/debug/wipe-database-998877', methods=['GET'])
 def secret_wipe():
     try:
+        # Log who we are about to delete
+        existing_users = User.query.all()
+        user_list = [f"{u.email}" for u in existing_users]
+        print(f"DEBUG: Wiping users: {user_list}")
+        
         db.drop_all()
         db.create_all()
-        return "Database wiped successfully! You can now register new accounts.", 200
+        user_count = User.query.count()
+        return f"Database wiped successfully! Removed users: {user_list}. Total users in DB now: {user_count}. You can now register new accounts.", 200
     except Exception as e:
         return f"Error wiping database: {str(e)}", 500
-
-db = SQLAlchemy(app)
-jwt = JWTManager(app)
 
 # Thread pool for processing
 executor = ThreadPoolExecutor(max_workers=5)  # Adjust max_workers based on your server resources
