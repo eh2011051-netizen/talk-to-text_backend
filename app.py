@@ -77,10 +77,22 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Configure APIs
-aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+if ASSEMBLYAI_API_KEY:
+    aai.settings.api_key = ASSEMBLYAI_API_KEY
+else:
+    logger.warning("ASSEMBLYAI_API_KEY not found in environment or .env file")
+
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
-    raise ValueError("Missing GEMINI_API_KEY in .env file")
+    logger.error("CRITICAL: GEMINI_API_KEY is missing!")
+    print("\n" + "="*50)
+    print("ERROR: Missing GEMINI_API_KEY")
+    print("Please add GEMINI_API_KEY to your environment variables")
+    print("or to your .env file.")
+    print("="*50 + "\n")
+    raise ValueError("Missing GEMINI_API_KEY. See logs above for details.")
+
 genai.configure(api_key=gemini_api_key)
 
 # Flask Configuration
