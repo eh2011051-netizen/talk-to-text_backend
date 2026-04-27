@@ -100,7 +100,7 @@ def home():
 app.config['UPLOAD_FOLDER'] = "uploads"
 app.config['OUTPUT_FOLDER'] = "outputs"
 import os
-from pathlib import Path
+from pathlib import Path    
 
 # Fix for deployment data loss: Ensure SQLite uses a persistent instance directory if PostgreSQL is not provided.
 DATA_DIR = os.getenv('DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance'))
@@ -274,6 +274,7 @@ class User(db.Model):
     privacy_last_seen     = db.Column(db.String(20), default='everyone')  # everyone|contacts|nobody
     privacy_profile_photo = db.Column(db.String(20), default='everyone')
     privacy_about         = db.Column(db.String(20), default='everyone')
+    privacy_groups        = db.Column(db.String(20), default='everyone')
     privacy_read_receipts = db.Column(db.Boolean, default=True)
 
 class Meeting(db.Model):
@@ -592,6 +593,8 @@ with app.app_context():
                 conn.execute(text("ALTER TABLE user ADD COLUMN privacy_profile_photo VARCHAR(20) DEFAULT 'everyone'"))
             if 'privacy_about' not in columns:
                 conn.execute(text("ALTER TABLE user ADD COLUMN privacy_about VARCHAR(20) DEFAULT 'everyone'"))
+            if 'privacy_groups' not in columns:
+                conn.execute(text("ALTER TABLE user ADD COLUMN privacy_groups VARCHAR(20) DEFAULT 'everyone'"))
             if 'privacy_read_receipts' not in columns:
                 conn.execute(text("ALTER TABLE user ADD COLUMN privacy_read_receipts BOOLEAN DEFAULT 1"))
                 
@@ -5417,15 +5420,31 @@ def get_friends():
             is_read=False
         ).count()
 
+        # Privacy settings checks
+        their_photo_privacy = getattr(other_user, 'privacy_profile_photo', 'everyone')
+        their_about_privacy = getattr(other_user, 'privacy_about', 'everyone')
+        
+        # Check if they are my contact (accepted friendship where I am the friend, or they are the friend)
+        is_contact = f.status == 'accepted' if hasattr(f, 'status') else True # Simplified since Friendship exists
+
+        # Apply privacy rules to hide data if needed
+        final_image = other_user.image
+        if their_photo_privacy == 'nobody' or (their_photo_privacy == 'contacts' and not is_contact):
+            final_image = None
+            
+        final_bio = other_user.bio
+        if their_about_privacy == 'nobody' or (their_about_privacy == 'contacts' and not is_contact):
+            final_bio = ""
+
         friends.append({
             "id": other_user.id,
             "name": f"{other_user.full_name} (You)" if other_user.id == user_id else other_user.full_name,
             "email": other_user.email,
-            "image": other_user.image,
+            "image": final_image,
             "isFriend": True,
             "status": other_user.status,
             "lastSeen": other_user.last_seen.isoformat() if other_user.last_seen else None,
-            "bio": other_user.bio,
+            "bio": final_bio,
             "isPinned": f.is_pinned,
             "isBlocked": i_blocked_them,
             "hasBlockedMe": they_blocked_me,
@@ -5523,17 +5542,39 @@ def create_group():
     # Add creator as admin
     db.session.add(GroupMember(group_id=new_group.id, user_id=user_id, role='admin'))
     
-    # Send invites to other members instead of adding them directly
+    # Send invites or add directly based on privacy
     for m_id in member_ids:
         if int(m_id) != user_id:
-            existing_invite = GroupInvite.query.filter_by(group_id=new_group.id, invitee_id=int(m_id), status='pending').first()
-            if not existing_invite:
-                db.session.add(GroupInvite(
-                    group_id=new_group.id,
-                    inviter_id=user_id,
-                    invitee_id=int(m_id),
-                    status='pending'
-                ))
+            invitee_id = int(m_id)
+            invitee = db.session.get(User, invitee_id)
+            if not invitee: continue
+            
+            p_groups = getattr(invitee, 'privacy_groups', 'everyone')
+            can_add_directly = False
+            if p_groups == 'everyone':
+                can_add_directly = True
+            elif p_groups == 'contacts':
+                is_contact = Friendship.query.filter(
+                    ((Friendship.user_id == user_id) & (Friendship.friend_id == invitee_id)) |
+                    ((Friendship.user_id == invitee_id) & (Friendship.friend_id == user_id)),
+                    Friendship.is_deleted == False
+                ).first()
+                if is_contact:
+                    can_add_directly = True
+                    
+            if can_add_directly:
+                # Add directly!
+                db.session.add(GroupMember(group_id=new_group.id, user_id=invitee_id, role='member'))
+            else:
+                # Need an invite
+                existing_invite = GroupInvite.query.filter_by(group_id=new_group.id, invitee_id=invitee_id, status='pending').first()
+                if not existing_invite:
+                    db.session.add(GroupInvite(
+                        group_id=new_group.id,
+                        inviter_id=user_id,
+                        invitee_id=invitee_id,
+                        status='pending'
+                    ))
             
     db.session.commit()
     
@@ -5601,15 +5642,39 @@ def send_group_invite(group_id):
         if GroupInvite.query.filter_by(group_id=group_id, invitee_id=uid, status='pending').first():
             skipped.append({"userId": uid, "reason": "already_invited"})
             continue
-        invite = GroupInvite(
-            group_id=group_id,
-            inviter_id=inviter_id,
-            invitee_id=uid,
-            status='pending',
-            created_at=datetime.now(timezone.utc)
-        )
-        db.session.add(invite)
-        sent.append(uid)
+        invitee = db.session.get(User, uid)
+        if not invitee:
+            skipped.append({"userId": uid, "reason": "not_found"})
+            continue
+            
+        p_groups = getattr(invitee, 'privacy_groups', 'everyone')
+        can_add_directly = False
+        if p_groups == 'everyone':
+            can_add_directly = True
+        elif p_groups == 'contacts':
+            is_contact = Friendship.query.filter(
+                ((Friendship.user_id == inviter_id) & (Friendship.friend_id == uid)) |
+                ((Friendship.user_id == uid) & (Friendship.friend_id == inviter_id)),
+                Friendship.is_deleted == False
+            ).first()
+            if is_contact:
+                can_add_directly = True
+                
+        if can_add_directly:
+            # Add directly instead of sending an invite
+            db.session.add(GroupMember(group_id=group_id, user_id=uid, role='member'))
+            sent.append(uid) # Technically added, but we'll include in sent
+        else:
+            # Send invite
+            invite = GroupInvite(
+                group_id=group_id,
+                inviter_id=inviter_id,
+                invitee_id=uid,
+                status='pending',
+                created_at=datetime.now(timezone.utc)
+            )
+            db.session.add(invite)
+            sent.append(uid)
 
     db.session.commit()
     return jsonify({"success": True, "sent": sent, "skipped": skipped})
@@ -6317,8 +6382,20 @@ def get_messages(other_user_id):
         ((Message.sender_id == other_user_id) & (Message.receiver_id == user_id))
     ).order_by(Message.timestamp.asc()).all()
     
-    # Mark as read
-    Message.query.filter_by(sender_id=other_user_id, receiver_id=user_id, is_read=False).update({"is_read": True})
+    # Mark as delivered + read, and create/update MessageReceipt records
+    # This ensures the SENDER sees correct tick status (single â†’ double grey â†’ double blue)
+    now = datetime.now(timezone.utc)
+    unread_msgs = Message.query.filter_by(sender_id=other_user_id, receiver_id=user_id, is_read=False).all()
+    for unread_msg in unread_msgs:
+        unread_msg.is_read = True
+        receipt = MessageReceipt.query.filter_by(message_id=unread_msg.id, user_id=user_id).first()
+        if not receipt:
+            receipt = MessageReceipt(message_id=unread_msg.id, user_id=user_id)
+            db.session.add(receipt)
+        if not receipt.delivered_at:
+            receipt.delivered_at = now
+        if not receipt.read_at:
+            receipt.read_at = now
     db.session.commit()
     
     result = []
@@ -6640,20 +6717,25 @@ def update_message_receipt():
         else:
             return jsonify({"error": "Receipt not found or unauthorized"}), 404
 
+    user = db.session.get(User, user_id)
+    allow_read_receipts = getattr(user, 'privacy_read_receipts', True)
+
     now = datetime.now(timezone.utc)
     if status_type == 'delivered' and not receipt.delivered_at:
         receipt.delivered_at = now
     elif status_type == 'read':
         if not receipt.delivered_at: receipt.delivered_at = now
-        if not receipt.read_at: receipt.read_at = now
-        # Also sync legacy is_read
-        msg = db.session.get(Message, message_id)
-        if msg and msg.receiver_id == user_id:
-            msg.is_read = True
-    elif status_type == 'played' and not receipt.played_at:
+        if allow_read_receipts:
+            if not receipt.read_at: receipt.read_at = now
+            # Also sync legacy is_read
+            msg = db.session.get(Message, message_id)
+            if msg and msg.receiver_id == user_id:
+                msg.is_read = True
+    elif status_type == 'played':
         if not receipt.delivered_at: receipt.delivered_at = now
-        if not receipt.read_at: receipt.read_at = now
-        receipt.played_at = now
+        if allow_read_receipts:
+            if not receipt.read_at: receipt.read_at = now
+            if not receipt.played_at: receipt.played_at = now
         
     db.session.commit()
     return jsonify({"success": True})
@@ -7075,7 +7157,15 @@ def presence_statuses():
             if activity == 'offline':
                 # Fall back to DB last_seen
                 u = db.session.get(User, fid)
-                last_seen = u.last_seen.isoformat() + 'Z' if u and u.last_seen else None
+                # Respect friend's privacy setting
+                friend_privacy = getattr(u, 'privacy_last_seen', 'everyone') if u else 'everyone'
+                if friend_privacy == 'nobody':
+                    last_seen = None  # Hidden by privacy settings
+                elif friend_privacy == 'contacts':
+                    # Only show to contacts (which they are since they're friends)
+                    last_seen = u.last_seen.isoformat() + 'Z' if u and u.last_seen else None
+                else:
+                    last_seen = u.last_seen.isoformat() + 'Z' if u and u.last_seen else None
             else:
                 last_seen = datetime.now(timezone.utc).isoformat() + 'Z'
             result[str(fid)] = {
@@ -7171,6 +7261,7 @@ def get_privacy():
         "lastSeen":     getattr(user, 'privacy_last_seen',     'everyone'),
         "profilePhoto": getattr(user, 'privacy_profile_photo', 'everyone'),
         "about":        getattr(user, 'privacy_about',         'everyone'),
+        "groups":       getattr(user, 'privacy_groups',        'everyone'),
         "readReceipts": getattr(user, 'privacy_read_receipts', True),
     })
 
@@ -7186,6 +7277,7 @@ def update_privacy():
     if 'lastSeen'     in data and data['lastSeen']     in valid: user.privacy_last_seen     = data['lastSeen']
     if 'profilePhoto' in data and data['profilePhoto'] in valid: user.privacy_profile_photo = data['profilePhoto']
     if 'about'        in data and data['about']        in valid: user.privacy_about         = data['about']
+    if 'groups'       in data and data['groups']       in valid: user.privacy_groups        = data['groups']
     if 'readReceipts' in data: user.privacy_read_receipts = bool(data['readReceipts'])
     db.session.commit()
     return jsonify({"success": True})
