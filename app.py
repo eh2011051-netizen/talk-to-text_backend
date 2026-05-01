@@ -77,22 +77,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Configure APIs
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-if ASSEMBLYAI_API_KEY:
-    aai.settings.api_key = ASSEMBLYAI_API_KEY
-else:
-    logger.warning("ASSEMBLYAI_API_KEY not found in environment or .env file")
-
+aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
-    logger.error("CRITICAL: GEMINI_API_KEY is missing!")
-    print("\n" + "="*50)
-    print("ERROR: Missing GEMINI_API_KEY")
-    print("Please add GEMINI_API_KEY to your environment variables")
-    print("or to your .env file.")
-    print("="*50 + "\n")
-    raise ValueError("Missing GEMINI_API_KEY. See logs above for details.")
-
+    raise ValueError("Missing GEMINI_API_KEY in .env file")
 genai.configure(api_key=gemini_api_key)
 
 # Flask Configuration
@@ -412,6 +400,8 @@ class Message(db.Model):
     deleted_for = db.Column(db.Text, default='[]')
     is_starred_by = db.Column(db.Text, default='[]')
     reaction = db.Column(db.String(32), nullable=True)  # emoji reaction
+    view_once = db.Column(db.Boolean, default=False)
+    duration = db.Column(db.Integer, nullable=True)
 
 class MessageReceipt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -687,6 +677,12 @@ with app.app_context():
             if 'is_starred_by' not in msg_columns:
                 logger.info("Migrating database: Adding is_starred_by column to message")
                 conn.execute(text("ALTER TABLE message ADD COLUMN is_starred_by TEXT DEFAULT '[]'"))
+            if 'view_once' not in msg_columns:
+                logger.info("Migrating database: Adding view_once column to message")
+                conn.execute(text("ALTER TABLE message ADD COLUMN view_once BOOLEAN DEFAULT 0"))
+            if 'duration' not in msg_columns:
+                logger.info("Migrating database: Adding duration column to message")
+                conn.execute(text("ALTER TABLE message ADD COLUMN duration INTEGER"))
 
             # Migration for group_member table (preferences)
             gm_info = conn.execute(text("PRAGMA table_info(group_member)")).fetchall()
@@ -5755,6 +5751,28 @@ def update_group_image(group_id):
     
     return jsonify({"success": True})
 
+@friends_bp.route('/api/groups/<int:group_id>/rename', methods=['POST'])
+@jwt_required()
+def rename_group(group_id):
+    user_id = int(get_jwt_identity())
+    data = request.json
+    new_name = data.get('name')
+    if not new_name:
+        return jsonify({"error": "Name is required"}), 400
+    
+    # Check if admin
+    membership = GroupMember.query.filter_by(group_id=group_id, user_id=user_id, role='admin').first()
+    if not membership:
+        return jsonify({"error": "Only admins can rename the group"}), 403
+        
+    group = db.session.get(Group, group_id)
+    if not group:
+        return jsonify({"error": "Group not found"}), 404
+        
+    group.name = new_name
+    db.session.commit()
+    return jsonify({"success": True})
+
 @friends_bp.route('/api/calls/log', methods=['GET'])
 @jwt_required()
 def get_call_logs():
@@ -6439,6 +6457,8 @@ def get_messages(other_user_id):
             "time": m.timestamp.isoformat() + 'Z',
             "type": m.type,
             "mediaUrl": m.media_url,
+            "viewOnce": getattr(m, 'view_once', False),
+            "duration": getattr(m, 'duration', None),
             "isRead": m.is_read,
             "status": status,
             "isDeleted": m.is_deleted,
@@ -6494,6 +6514,8 @@ def get_group_messages(group_id):
             "text": "This message was deleted" if m.is_deleted else m.text,
             "type": m.type,
             "mediaUrl": m.media_url,
+            "viewOnce": getattr(m, 'view_once', False),
+            "duration": getattr(m, 'duration', None),
             "time": m.timestamp.isoformat() + 'Z',
             "isRead": m.is_read,
             "status": status,
@@ -6559,6 +6581,8 @@ def get_broadcast_messages(list_id):
             'text': 'This message was deleted' if m.is_deleted else m.text,
             'type': m.type,
             'mediaUrl': m.media_url,
+            'viewOnce': getattr(m, 'view_once', False),
+            'duration': getattr(m, 'duration', None),
             'time': m.timestamp.isoformat() + 'Z',
             'isRead': m.is_read,
             'status': status,
@@ -6613,7 +6637,36 @@ def send_message():
     msg_type = data.get('type', 'text')
     media_url = data.get('mediaUrl')
     reply_to_id = data.get('reply_to_id')
+    view_once = data.get('view_once', False)
+    duration = data.get('duration')
+    trim_start = data.get('trim_start')
+    trim_end = data.get('trim_end')
+
+    import subprocess
+    import uuid
+    # Handle video trimming
+    if media_url and trim_start is not None and trim_end is not None and msg_type in ('video', 'voice'):
+        if media_url.startswith('/uploads/chat/'):
+            filename = media_url.split('/')[-1]
+            local_path = os.path.join(app.config['UPLOAD_FOLDER'], 'chat', filename)
+            if os.path.exists(local_path):
+                ext = os.path.splitext(filename)[1]
+                trimmed_name = f"trimmed_{uuid.uuid4().hex}{ext}"
+                trimmed_path = os.path.join(app.config['UPLOAD_FOLDER'], 'chat', trimmed_name)
+                try:
+                    subprocess.run([
+                        'ffmpeg', '-y', '-i', local_path, 
+                        '-ss', str(trim_start), '-to', str(trim_end), 
+                        '-c', 'copy', trimmed_path
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    media_url = f"/uploads/chat/{trimmed_name}"
+                    try:
+                        os.remove(local_path)
+                    except: pass
+                except Exception as e:
+                    logger.error(f"Error trimming media: {e}")
     
+
     if not any([receiver_id, group_id, broadcast_id]):
         return jsonify({"error": "No recipient specified"}), 400
         
@@ -6635,7 +6688,9 @@ def send_message():
             text=text,
             type=msg_type,
             media_url=media_url,
-            reply_to_id=reply_to_id
+            reply_to_id=reply_to_id,
+            view_once=view_once,
+            duration=duration
         )
         db.session.add(broadcast_msg)
         bl.last_used = datetime.now(timezone.utc)
@@ -6653,6 +6708,8 @@ def send_message():
             'mediaUrl': broadcast_msg.media_url,
             'time': broadcast_msg.timestamp.isoformat() + 'Z',
             'status': 'sent',
+            'viewOnce': broadcast_msg.view_once,
+            'duration': broadcast_msg.duration,
             'reply_to_id': broadcast_msg.reply_to_id,
             'replyTo': {
                 "id": rm.id,
@@ -6671,7 +6728,9 @@ def send_message():
         text=text,
         type=msg_type,
         media_url=media_url,
-        reply_to_id=reply_to_id
+        reply_to_id=reply_to_id,
+        view_once=view_once,
+        duration=duration
     )
     db.session.add(msg)
     db.session.flush() # Get msg.id
@@ -6696,6 +6755,8 @@ def send_message():
         "time": msg.timestamp.isoformat() + 'Z',
         "type": msg.type,
         "mediaUrl": msg.media_url,
+        "viewOnce": msg.view_once,
+        "duration": msg.duration,
         "reply_to_id": msg.reply_to_id,
         "replyTo": {
             "id": rm.id,
@@ -6846,6 +6907,39 @@ def exit_group(group_id):
     membership.is_exited = True
     db.session.commit()
     return jsonify({"success": True})
+
+@friends_bp.route('/api/messages/<int:msg_id>/edit', methods=['POST'])
+@jwt_required()
+def edit_message(msg_id):
+    user_id = int(get_jwt_identity())
+    data = request.json
+    new_text = data.get('text')
+    
+    if not new_text:
+        return jsonify({"error": "New text is required"}), 400
+        
+    msg = db.session.get(Message, msg_id)
+    if not msg:
+        return jsonify({"error": "Message not found"}), 404
+        
+    if msg.sender_id != user_id:
+        return jsonify({"error": "Unauthorized to edit this message"}), 403
+        
+    if msg.is_deleted:
+        return jsonify({"error": "Cannot edit a deleted message"}), 400
+        
+    msg.text = new_text
+    db.session.commit()
+    
+    return jsonify({
+        "id": msg.id,
+        "text": msg.text,
+        "sender": "me",
+        "time": msg.timestamp.isoformat() + 'Z',
+        "type": msg.type,
+        "mediaUrl": msg.media_url,
+        "status": 'sent'
+    })
 
 @friends_bp.route('/api/messages/<int:msg_id>/delete', methods=['POST'])
 @jwt_required()
@@ -7191,10 +7285,11 @@ def presence_statuses():
 @friends_bp.route('/api/friends/unread-counts', methods=['GET'])
 @jwt_required()
 def get_unread_counts():
-    """Lightweight endpoint â€” returns {friend_id: unread_count} map."""
+    """Returns {chat_id: {unreadCount, lastMessage, lastMessageTime, lastMessageType}} map."""
     user_id = int(get_jwt_identity())
-    counts  = {}
-    # DM unread
+    summaries = {}
+    
+    # DM summaries
     friendships = Friendship.query.filter(
         ((Friendship.user_id == user_id) | (Friendship.friend_id == user_id)),
         Friendship.is_deleted == False
@@ -7204,8 +7299,20 @@ def get_unread_counts():
         count = Message.query.filter_by(
             sender_id=other_id, receiver_id=user_id, is_read=False
         ).count()
-        counts[f'u_{other_id}'] = count
-    # Group unread
+        
+        last_msg = Message.query.filter(
+            ((Message.sender_id == user_id) & (Message.receiver_id == other_id)) |
+            ((Message.sender_id == other_id) & (Message.receiver_id == user_id))
+        ).order_by(Message.timestamp.desc()).first()
+
+        summaries[f'u_{other_id}'] = {
+            "unreadCount": count,
+            "lastMessage": last_msg.text if last_msg else None,
+            "lastMessageTime": last_msg.timestamp.isoformat() + 'Z' if last_msg else None,
+            "lastMessageType": last_msg.type if last_msg else 'text'
+        }
+
+    # Group summaries
     memberships = GroupMember.query.filter_by(user_id=user_id, is_exited=False).all()
     for m in memberships:
         count = Message.query.filter(
@@ -7218,8 +7325,16 @@ def get_unread_counts():
                 )
             )
         ).count()
-        counts[f'g_{m.group_id}'] = count
-    return jsonify(counts)
+        
+        last_msg = Message.query.filter_by(group_id=m.group_id).order_by(Message.timestamp.desc()).first()
+
+        summaries[f'g_{m.group_id}'] = {
+            "unreadCount": count,
+            "lastMessage": last_msg.text if last_msg else None,
+            "lastMessageTime": last_msg.timestamp.isoformat() + 'Z' if last_msg else None,
+            "lastMessageType": last_msg.type if last_msg else 'text'
+        }
+    return jsonify(summaries)
 
 
 # â”€â”€â”€ CHAT MEDIA UPLOAD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -7247,8 +7362,11 @@ def chat_media_upload():
     unique_name = f"chat_{_uuid.uuid4().hex}{ext}"
     save_dir    = os.path.join(app.config['UPLOAD_FOLDER'], 'chat')
     os.makedirs(save_dir, exist_ok=True)
-    f.save(os.path.join(save_dir, unique_name))
-
+    
+    trim_start = request.form.get('trim_start')
+    trim_end = request.form.get('trim_end')
+    
+    # Identify media type early to decide on trimming
     if mime.startswith('audio') or ext in ('.webm','.mp3','.ogg','.wav','.m4a','.opus'):
         media_type = 'voice'
     elif mime.startswith('video') or ext in ('.mp4','.mov','.avi','.mkv'):
@@ -7257,6 +7375,28 @@ def chat_media_upload():
         media_type = 'image'
     else:
         media_type = 'file'
+
+    if (trim_start or trim_end) and media_type == 'video':
+        try:
+            temp_input = os.path.join(save_dir, f"raw_{unique_name}")
+            f.save(temp_input)
+            output_path = os.path.join(save_dir, unique_name)
+            
+            import subprocess
+            cmd = ['ffmpeg', '-y']
+            if trim_start: cmd.extend(['-ss', str(trim_start)])
+            if trim_end: cmd.extend(['-to', str(trim_end)])
+            cmd.extend(['-i', temp_input, '-c', 'copy', output_path])
+            
+            subprocess.run(cmd, check=True, capture_output=True)
+            if os.path.exists(temp_input):
+                os.remove(temp_input)
+        except Exception as e:
+            logger.error(f"Trim error: {e}")
+            f.seek(0)
+            f.save(os.path.join(save_dir, unique_name))
+    else:
+        f.save(os.path.join(save_dir, unique_name))
 
     return jsonify({"url": f"/uploads/chat/{unique_name}", "type": media_type, "filename": f.filename or unique_name})
 

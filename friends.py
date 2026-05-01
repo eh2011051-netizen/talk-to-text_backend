@@ -28,18 +28,53 @@ def get_friends():
         Friendship.is_deleted == False
     ).all()
     
+    if not friendships:
+        return jsonify([])
+
+    friend_ids = [f.friend_id if f.user_id == user_id else f.user_id for f in friendships]
+    other_users = {u.id: u for u in User.query.filter(User.id.in_(friend_ids)).all()}
+    
+    # Bulk fetch unread counts
+    unread_counts_raw = db.session.query(
+        Message.sender_id, db.func.count(Message.id)
+    ).filter(
+        Message.receiver_id == user_id,
+        Message.is_read == False,
+        Message.sender_id.in_(friend_ids)
+    ).group_by(Message.sender_id).all()
+    unread_counts = {sender_id: count for sender_id, count in unread_counts_raw}
+
+    # Bulk fetch last messages
+    # This is slightly more complex in SQL, so we'll fetch them efficiently
+    from sqlalchemy import and_, or_
+    
+    # Get the latest message ID for each conversation
+    subquery = db.session.query(
+        db.func.max(Message.id).label('max_id')
+    ).filter(
+        or_(
+            and_(Message.sender_id == user_id, Message.receiver_id.in_(friend_ids)),
+            and_(Message.receiver_id == user_id, Message.sender_id.in_(friend_ids))
+        )
+    ).group_by(
+        db.func.case(
+            (Message.sender_id == user_id, Message.receiver_id),
+            else_=Message.sender_id
+        )
+    ).subquery()
+
+    last_msgs_raw = Message.query.filter(Message.id.in_(subquery)).all()
+    last_msgs = {}
+    for m in last_msgs_raw:
+        other_id = m.receiver_id if m.sender_id == user_id else m.sender_id
+        last_msgs[other_id] = m
+
     friends = []
     for f in friendships:
         other_id = f.friend_id if f.user_id == user_id else f.user_id
-        other_user = User.query.get(other_id)
+        other_user = other_users.get(other_id)
         if other_user:
-            # Check for unread count
-            unread_count = Message.query.filter_by(
-                sender_id=other_id, 
-                receiver_id=user_id, 
-                is_read=False
-            ).count()
-            
+            last_msg = last_msgs.get(other_id)
             friends.append({
                 "id": other_user.id,
                 "name": other_user.full_name,
@@ -55,50 +90,83 @@ def get_friends():
                 "isMuted": f.is_muted,
                 "isArchived": f.is_archived,
                 "isFavourite": f.is_favourite,
-                "unreadCount": unread_count
+                "unreadCount": unread_counts.get(other_id, 0),
+                "lastMessage": last_msg.text if last_msg else None,
+                "lastMessageTime": last_msg.timestamp.isoformat() + 'Z' if last_msg else None,
+                "lastMessageType": last_msg.type if last_msg else 'text'
             })
     return jsonify(friends)
 
 @friends_bp.route('/api/groups', methods=['GET'])
 @jwt_required()
 def get_groups():
-    from app import Group, GroupMember
+    from app import Group, GroupMember, Message, db
+    from sqlalchemy.orm import joinedload
     user_id = int(get_jwt_identity())
-    # Get all groups where the user is a member
-    memberships = GroupMember.query.filter_by(user_id=user_id).all()
     
-    groups = []
-    for m in memberships:
-        group = Group.query.get(m.group_id)
-        if group:
-            # Get members for the group
-            group_members = GroupMember.query.filter_by(group_id=group.id).all()
-            member_ids = [gm.user_id for gm in group_members if not gm.is_exited]
-            admin_ids = [gm.user_id for gm in group_members if gm.role == 'admin' and not gm.is_exited]
-            
-            # The current user's membership
-            my_membership = next((gm for gm in group_members if gm.user_id == user_id), None)
-            is_exited = my_membership.is_exited if my_membership else False
-            
-            groups.append({
-                "id": group.id,
-                "name": group.name,
-                "image": group.image,
-                "isGroup": True,
-                "bio": f"{len(group_members)} members",
-                "description": group.description,
-                "memberIds": member_ids,
-                "adminIds": admin_ids,
-                "creatorId": group.created_by_id,
-                "createdAt": group.created_at.isoformat(),
-                "isExited": is_exited,
-                "groupSettings": {
-                    "onlyAdminsCanEditInfo": False,
-                    "onlyAdminsCanAddMembers": False,
-                    "onlyAdminsCanSendMessages": False
-                }
-            })
-    return jsonify(groups)
+    # Get all memberships for the user
+    memberships = GroupMember.query.filter_by(user_id=user_id).all()
+    if not memberships:
+        return jsonify([])
+        
+    group_ids = [m.group_id for m in memberships]
+    
+    # Bulk fetch groups with their members
+    groups_data = Group.query.filter(Group.id.in_(group_ids)).all()
+    
+    # Bulk fetch all members for these groups to avoid N queries
+    all_group_members = GroupMember.query.filter(GroupMember.group_id.in_(group_ids)).all()
+    
+    # Organize members by group
+    members_by_group = {}
+    for gm in all_group_members:
+        if gm.group_id not in members_by_group:
+            members_by_group[gm.group_id] = []
+        members_by_group[gm.group_id].append(gm)
+        
+    # Bulk fetch last messages for each group
+    # We'll use a subquery to find the latest message ID per group
+    last_msg_subquery = db.session.query(
+        Message.group_id,
+        db.func.max(Message.id).label('max_id')
+    ).filter(Message.group_id.in_(group_ids)).group_by(Message.group_id).subquery()
+    
+    last_messages_raw = Message.query.filter(Message.id.in_(db.session.query(last_msg_subquery.c.max_id))).all()
+    last_messages = {m.group_id: m for m in last_messages_raw}
+
+    result = []
+    for group in groups_data:
+        group_members = members_by_group.get(group.id, [])
+        member_ids = [gm.user_id for gm in group_members if not gm.is_exited]
+        admin_ids = [gm.user_id for gm in group_members if gm.role == 'admin' and not gm.is_exited]
+        
+        my_membership = next((gm for gm in group_members if gm.user_id == user_id), None)
+        is_exited = my_membership.is_exited if my_membership else False
+        
+        last_msg = last_messages.get(group.id)
+
+        result.append({
+            "id": group.id,
+            "name": group.name,
+            "image": group.image,
+            "isGroup": True,
+            "bio": f"{len(member_ids)} members",
+            "description": group.description,
+            "memberIds": member_ids,
+            "adminIds": admin_ids,
+            "creatorId": group.created_by_id,
+            "createdAt": group.created_at.isoformat(),
+            "isExited": is_exited,
+            "groupSettings": {
+                "onlyAdminsCanEditInfo": False,
+                "onlyAdminsCanAddMembers": False,
+                "onlyAdminsCanSendMessages": False
+            },
+            "lastMessage": last_msg.text if last_msg else None,
+            "lastMessageTime": last_msg.timestamp.isoformat() + 'Z' if last_msg else None,
+            "lastMessageType": last_msg.type if last_msg else 'text'
+        })
+    return jsonify(result)
 
 @friends_bp.route('/api/groups', methods=['POST'])
 @jwt_required()
@@ -152,14 +220,29 @@ def get_group_invites():
     from app import Group, GroupInvite, GroupMember, User
     user_id = int(get_jwt_identity())
     invites = GroupInvite.query.filter_by(invitee_id=user_id, status='pending').all()
+    if not invites:
+        return jsonify([])
+
+    # Bulk fetch related groups and inviters
+    group_ids = [i.group_id for i in invites]
+    inviter_ids = [i.inviter_id for i in invites]
+    
+    groups = {g.id: g for g in Group.query.filter(Group.id.in_(group_ids)).all()}
+    inviters = {u.id: u for u in User.query.filter(User.id.in_(inviter_ids)).all()}
+    
+    # Bulk fetch member counts
+    from app import db
+    member_counts_raw = db.session.query(
+        GroupMember.group_id, db.func.count(GroupMember.id)
+    ).filter(GroupMember.group_id.in_(group_ids)).group_by(GroupMember.group_id).all()
+    member_counts = {group_id: count for group_id, count in member_counts_raw}
 
     result = []
     for i in invites:
-        group = Group.query.get(i.group_id)
-        inviter = User.query.get(i.inviter_id)
+        group = groups.get(i.group_id)
+        inviter = inviters.get(i.inviter_id)
         if not group or not inviter:
             continue
-        member_count = GroupMember.query.filter_by(group_id=group.id).count()
         result.append({
             "id": i.id,
             "groupId": group.id,
@@ -168,7 +251,7 @@ def get_group_invites():
             "groupDescription": group.description,
             "inviterName": inviter.full_name,
             "inviterImage": inviter.image,
-            "memberCount": member_count,
+            "memberCount": member_counts.get(group.id, 0),
             "timestamp": i.created_at.isoformat()
         })
     return jsonify(result)
@@ -296,15 +379,25 @@ def get_call_logs():
         (CallLog.user_id == user_id)
     ).order_by(CallLog.timestamp.desc()).all()
     
-    return jsonify([{
-        "id": l.id,
-        "name": User.query.get(l.other_user_id).full_name if l.other_user_id else "Unknown",
-        "image": User.query.get(l.other_user_id).image if l.other_user_id else None,
-        "type": l.type,
-        "isVideo": l.is_video,
-        "timestamp": l.timestamp.isoformat(),
-        "duration": l.duration
-    } for l in logs])
+    if not logs:
+        return jsonify([])
+        
+    other_user_ids = [l.other_user_id for l in logs if l.other_user_id]
+    other_users = {u.id: u for u in User.query.filter(User.id.in_(other_user_ids)).all()}
+    
+    result = []
+    for l in logs:
+        u = other_users.get(l.other_user_id)
+        result.append({
+            "id": l.id,
+            "name": u.full_name if u else "Unknown",
+            "image": u.image if u else None,
+            "type": l.type,
+            "isVideo": l.is_video,
+            "timestamp": l.timestamp.isoformat(),
+            "duration": l.duration
+        })
+    return jsonify(result)
 
 @friends_bp.route('/api/broadcast-lists', methods=['GET'])
 @jwt_required()
@@ -332,14 +425,17 @@ def get_requests():
     incoming = FriendRequest.query.filter_by(receiver_id=user_id, status='pending').all()
     outgoing = FriendRequest.query.filter_by(sender_id=user_id, status='pending').all()
     
+    all_related_ids = [r.sender_id for r in incoming] + [r.receiver_id for r in outgoing]
+    users = {u.id: u for u in User.query.filter(User.id.in_(all_related_ids)).all()}
+    
     return jsonify({
         "incoming": [{
             "id": r.id,
             "sender": {
                 "id": r.sender_id,
-                "name": User.query.get(r.sender_id).full_name,
-                "email": User.query.get(r.sender_id).email,
-                "image": User.query.get(r.sender_id).image
+                "name": users.get(r.sender_id).full_name if users.get(r.sender_id) else "Unknown",
+                "email": users.get(r.sender_id).email if users.get(r.sender_id) else "",
+                "image": users.get(r.sender_id).image if users.get(r.sender_id) else None
             },
             "created_at": r.created_at.isoformat()
         } for r in incoming],
@@ -347,9 +443,9 @@ def get_requests():
             "id": r.id,
             "receiver": {
                 "id": r.receiver_id,
-                "name": User.query.get(r.receiver_id).full_name,
-                "email": User.query.get(r.receiver_id).email,
-                "image": User.query.get(r.receiver_id).image
+                "name": users.get(r.receiver_id).full_name if users.get(r.receiver_id) else "Unknown",
+                "email": users.get(r.receiver_id).email if users.get(r.receiver_id) else "",
+                "image": users.get(r.receiver_id).image if users.get(r.receiver_id) else None
             },
             "created_at": r.created_at.isoformat()
         } for r in outgoing]
@@ -525,6 +621,8 @@ def get_messages(other_user_id):
             "time": m.timestamp.isoformat() + 'Z',
             "type": m.type,
             "mediaUrl": m.media_url,
+            "viewOnce": getattr(m, 'view_once', False),
+            "duration": getattr(m, 'duration', None),
             "isRead": m.is_read,
             "replyTo": reply_data,
             "reply_to_id": m.reply_to_id
@@ -564,6 +662,8 @@ def get_group_messages(group_id):
             "text": m.text,
             "type": m.type,
             "mediaUrl": m.media_url,
+            "viewOnce": getattr(m, 'view_once', False),
+            "duration": getattr(m, 'duration', None),
             "time": m.timestamp.isoformat() + 'Z',
             "isRead": m.is_read,
             "replyTo": reply_data,
